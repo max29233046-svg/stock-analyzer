@@ -1404,6 +1404,7 @@ function renderResult(r) {
         <div class="hprice">${priceDisp}<span class="hchg ${chgCls}">${chgDisp}</span></div>
       </div>
       <div class="hero-right">
+        <div style="font-size:9px;color:var(--text3);text-align:center;margin-bottom:4px;letter-spacing:.5px;">這支股票值不值得買？</div>
         <div class="bscore">${r.scores.total}</div>
         <div class="bsub">綜合評分 / 10</div>
       </div>
@@ -2188,6 +2189,47 @@ function entryScoreCard(r) {
   const circum = 2 * Math.PI * 28;
   const dash   = circum * total / 100;
 
+  // ── 建議等待進場價位（時機不佳時才顯示）──
+  let waitPriceHtml = '';
+  if (total < 60 && r.price) {
+    const p    = r.price;
+    const lo52 = r.weekLow52;
+
+    // 積極價：MA20
+    const aggressivePrice = r.ma20 ? Math.round(r.ma20) : null;
+    const aggressivePct   = aggressivePrice ? (((aggressivePrice - p) / p) * 100).toFixed(1) : null;
+
+    // 穩健價：MA60
+    const steadyPrice = r.ma60 ? Math.round(r.ma60) : null;
+    const steadyPct   = steadyPrice ? (((steadyPrice - p) / p) * 100).toFixed(1) : null;
+
+    // 保守價：費波那契 50% 回檔（從52週低點到目前股價的50%）
+    const conservativePrice = lo52 ? Math.round(lo52 + (p - lo52) * 0.5) : null;
+    const conservativePct   = conservativePrice ? (((conservativePrice - p) / p) * 100).toFixed(1) : null;
+
+    const priceRow = (label, basis, price, pct, color) => price ? `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--bg3);border-radius:6px;margin-bottom:6px;">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:${color};">${label}</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:2px;">${basis}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:14px;font-weight:800;color:${color};">NT$ ${price.toLocaleString()}</div>
+          <div style="font-size:10px;color:var(--text3);">${pct}%（距現價）</div>
+        </div>
+      </div>` : '';
+
+    waitPriceHtml = `
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px;">
+      <div style="font-size:11px;font-weight:700;color:#e0f0ff;margin-bottom:8px;">⏳ 建議等待進場價位</div>
+      <div style="font-size:10px;color:var(--text3);margin-bottom:10px;">時機尚未成熟，以下為回調後的合理進場參考區間（依風險偏好選擇）</div>
+      ${priceRow('積極價', 'MA20 月線支撐・小幅回調即可進場', aggressivePrice, aggressivePct, 'var(--cyan)')}
+      ${priceRow('穩健價', 'MA60 季線支撐・技術面修正充分', steadyPrice, steadyPct, 'var(--green)')}
+      ${priceRow('保守價', '費波 50% 回檔・等待更深修正', conservativePrice, conservativePct, 'var(--yellow)')}
+      <div style="font-size:10px;color:var(--text3);margin-top:6px;">💡 進場前仍需確認：RSI 回落 70 以下、週K指標不在超買區。價位僅為參考，非絕對買點。</div>
+    </div>`;
+  }
+
   return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;margin:12px 0;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
       <div>
@@ -2213,6 +2255,7 @@ function entryScoreCard(r) {
     <div style="font-size:10px;color:var(--text3);padding-top:8px;border-top:1px solid var(--border);">
       💡 進場時機分評估「現在進場的時機好不好」，與左方綜合評分（股票本身好不好）互補使用。
     </div>
+    ${waitPriceHtml}
   </div>`;
 }
 
