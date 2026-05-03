@@ -878,7 +878,7 @@ async function doFetch() {
   }
 
   // ── 平行發出所有請求 ──────────────────────────────────────
-  const [gasResult, instResult, marginResult, revResult] = await Promise.allSettled([
+  const [gasResult, instResult, marginResult, revResult, priceResult] = await Promise.allSettled([
     // 1. GAS：只抓股價 + 技術指標（含冷啟動重試）
     fetchGAS(code),
 
@@ -890,6 +890,9 @@ async function doFetch() {
 
     // 4. FinMind 直連：月營收（近 550 天，需比較去年同期）
     fmFetch('TaiwanStockMonthRevenue', code, 550),
+
+    // 5. FinMind 直連：每日收盤價（近 90 天，用於法人加權成本計算）
+    fmFetch('TaiwanStockPrice', code, 90),
   ]);
 
   if (myFetchId !== currentFetchId) return; // 已切換股票，丟棄結果
@@ -958,6 +961,8 @@ async function doFetch() {
         fetchedData.foreignNet20 = inst.foreign20d;
         fetchedData.trustNet20   = inst.invest20d;
         fetchedData.dealerNet    = inst.dealer5d;
+        // 保存原始法人資料，供後續加權成本計算使用
+        fetchedData.instRawRows  = rows;
         setChip('c-chip', 'ok');
         successCount++;
       } else {
@@ -967,6 +972,19 @@ async function doFetch() {
   } else {
     console.error('[inst Error]', instResult.reason);
     setChip('c-chip', 'err');
+  }
+
+  // ── 處理歷史每日股價（法人加權成本計算用）────────────────
+  if (priceResult.status === 'fulfilled') {
+    try {
+      const priceRows = priceResult.value;
+      if (priceRows && priceRows.length > 0 && fetchedData.instRawRows) {
+        const cost = calcInstitutionalCost(fetchedData.instRawRows, priceRows);
+        fetchedData.foreignCost  = cost.foreignCost;
+        fetchedData.trustCost    = cost.trustCost;
+        fetchedData.foreignNet20 = fetchedData.foreignNet20; // 保持不變
+      }
+    } catch(e) { console.error('[priceRows]', e); }
   }
 
   // ── 處理融資融券 ─────────────────────────────────────────
@@ -1020,6 +1038,57 @@ async function doFetch() {
   const total = 6; // price, tech, chip, margin, rev, pe（最後一個背景更新）
   setStatus(`✓ 主要資料抓取完成 ${successCount}/5，PE/PB 背景更新中，請補填手動欄位後按分析`, 'success');
   $('fetchBtn').disabled = false;
+}
+
+/* ══════════════════════════════════════════════════════════
+   法人加權持股成本計算
+   - 只計算「買超」的交易日（賣超日不納入，那是在出貨）
+   - 以當日收盤價 × 買超淨張數 加權平均
+   - 外資和投信分別計算，各取近 60 日
+══════════════════════════════════════════════════════════ */
+function calcInstitutionalCost(instRows, priceRows) {
+  // 建立日期 → 收盤價的 map
+  const priceMap = {};
+  priceRows.forEach(r => {
+    const close = parseFloat(r.close || r.Close || 0);
+    if (r.date && close > 0) priceMap[r.date] = close;
+  });
+
+  // 降冪排序，取近 60 個交易日
+  const allDates = [...new Set(instRows.map(r => r.date))].sort((a,b) => a>b?-1:1);
+  const dates60  = allDates.slice(0, 60);
+
+  let foreignNetSum = 0, foreignCostSum = 0;
+  let trustNetSum   = 0, trustCostSum   = 0;
+
+  instRows
+    .filter(r => dates60.includes(r.date))
+    .forEach(r => {
+      const buy    = parseInt(r.buy  || 0, 10);
+      const sell   = parseInt(r.sell || 0, 10);
+      const netShares = buy - sell; // 單位：股
+      const name   = (r.name || r.institution_name || '').trim();
+      const close  = priceMap[r.date];
+
+      if (!close || netShares <= 0) return; // 只計算買超日
+
+      const netLots = netShares / 1000; // 換算為張
+
+      if (name === 'Foreign_Investor') {
+        foreignNetSum  += netLots;
+        foreignCostSum += netLots * close;
+      } else if (name === 'Investment_Trust') {
+        trustNetSum  += netLots;
+        trustCostSum += netLots * close;
+      }
+    });
+
+  return {
+    foreignCost: foreignNetSum  > 0 ? Math.round(foreignCostSum / foreignNetSum)  : null,
+    trustCost:   trustNetSum    > 0 ? Math.round(trustCostSum   / trustNetSum)     : null,
+    foreignNetLots: Math.round(foreignNetSum),
+    trustNetLots:   Math.round(trustNetSum),
+  };
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1364,6 +1433,9 @@ function doAnalyze(e) {
     prevClose:    fetchedData.techRaw ? fetchedData.techRaw.prevClose    : null,
     vol5MA:       fetchedData.techRaw ? fetchedData.techRaw.vol5MA       : null,
     vol20MA:      fetchedData.techRaw ? fetchedData.techRaw.vol20MA      : null,
+    // 法人加權持股成本（calcInstitutionalCost 計算結果）
+    foreignCost:  fetchedData.foreignCost  || null,
+    trustCost:    fetchedData.trustCost    || null,
   };
 
   const scores  = computeScores(data);
@@ -2192,22 +2264,65 @@ function entryScoreCard(r) {
   // ── 建議等待進場價位（時機不佳時才顯示）──
   let waitPriceHtml = '';
   if (total < 60 && r.price) {
-    const p    = r.price;
-    const lo52 = r.weekLow52;
+    const p     = r.price;
+    const score = parseFloat(r.scores ? r.scores.total : 0);
+    const atr   = r.atr14 || 0;
+    const lo52  = r.weekLow52;
 
-    // 積極價：MA20
-    const aggressivePrice = r.ma20 ? Math.round(r.ma20) : null;
-    const aggressivePct   = aggressivePrice ? (((aggressivePrice - p) / p) * 100).toFixed(1) : null;
+    // 法人加權成本支撐（外資和投信取較高者，代表最近期的支撐力）
+    const foreignCost = r.foreignCost;
+    const trustCost   = r.trustCost;
+    let institutionalSupport = null;
+    let institutionalLabel   = '';
+    if (foreignCost && trustCost) {
+      institutionalSupport = Math.max(foreignCost, trustCost);
+      institutionalLabel   = `外資估算成本 NT$${foreignCost.toLocaleString()} ／ 投信估算成本 NT$${trustCost.toLocaleString()}`;
+    } else if (foreignCost) {
+      institutionalSupport = foreignCost;
+      institutionalLabel   = `外資近60日買超加權均價`;
+    } else if (trustCost) {
+      institutionalSupport = trustCost;
+      institutionalLabel   = `投信近60日買超加權均價`;
+    }
 
-    // 穩健價：MA60
-    const steadyPrice = r.ma60 ? Math.round(r.ma60) : null;
-    const steadyPct   = steadyPrice ? (((steadyPrice - p) / p) * 100).toFixed(1) : null;
+    let aggressivePrice, aggressiveBasis;
+    let steadyPrice,     steadyBasis;
+    let conservativePrice, conservativeBasis;
 
-    // 保守價：費波那契 50% 回檔（從52週低點到目前股價的50%）
-    const conservativePrice = lo52 ? Math.round(lo52 + (p - lo52) * 0.5) : null;
-    const conservativePct   = conservativePrice ? (((conservativePrice - p) / p) * 100).toFixed(1) : null;
+    if (score >= 7.5) {
+      // 強勢成長股：ATR 基礎，回調幅度小且實際可等到
+      aggressivePrice  = atr > 0 ? Math.round(p - 0.5 * atr) : null;
+      aggressiveBasis  = atr > 0 ? `現價 − 0.5×ATR（ATR=${Math.round(atr)}）・日內正常波動低點` : '需要 ATR 資料';
+      steadyPrice      = atr > 0 ? Math.round(p - 1.5 * atr) : null;
+      steadyBasis      = atr > 0 ? `現價 − 1.5×ATR・約一週正常回調幅度` : '需要 ATR 資料';
+      conservativePrice = atr > 0 ? Math.round(p - 3.0 * atr) : null;
+      conservativeBasis = atr > 0 ? `現價 − 3.0×ATR・較明顯修正但趨勢未破` : '需要 ATR 資料';
+    } else if (score >= 6.0) {
+      // 普通偏強：ATR + 均線混合
+      aggressivePrice  = atr > 0 ? Math.round(p - 1.0 * atr) : null;
+      aggressiveBasis  = `現價 − 1.0×ATR（ATR=${Math.round(atr)}）`;
+      steadyPrice      = r.ma20 ? Math.round(r.ma20) : null;
+      steadyBasis      = 'MA20 月線支撐';
+      const c1 = atr > 0 ? Math.round(p - 3.0 * atr) : null;
+      const c2 = r.ma60 ? Math.round(r.ma60) : null;
+      conservativePrice = (c1 && c2) ? Math.max(c1, c2) : (c1 || c2);
+      conservativeBasis = 'MA60 季線 與 3×ATR 取較高者';
+    } else {
+      // 普通或偏弱：均線 + 費波
+      aggressivePrice  = r.ma20 ? Math.round(r.ma20) : null;
+      aggressiveBasis  = 'MA20 月線支撐';
+      steadyPrice      = r.ma60 ? Math.round(r.ma60) : null;
+      steadyBasis      = 'MA60 季線支撐';
+      conservativePrice = lo52 ? Math.round(lo52 + (p - lo52) * 0.5) : null;
+      conservativeBasis = '費波 50% 回檔位';
+    }
 
-    const priceRow = (label, basis, price, pct, color) => price ? `
+    const pctStr = (price) => price ? ((price - p) / p * 100).toFixed(1) : null;
+
+    const priceRow = (label, basis, price, color) => {
+      if (!price) return '';
+      const pct = pctStr(price);
+      return `
       <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--bg3);border-radius:6px;margin-bottom:6px;">
         <div>
           <div style="font-size:11px;font-weight:700;color:${color};">${label}</div>
@@ -2217,16 +2332,76 @@ function entryScoreCard(r) {
           <div style="font-size:14px;font-weight:800;color:${color};">NT$ ${price.toLocaleString()}</div>
           <div style="font-size:10px;color:var(--text3);">${pct}%（距現價）</div>
         </div>
+      </div>`;
+    };
+
+    // 法人成本支撐列（只在低於現價時才顯示）
+    const instRow = (institutionalSupport && institutionalSupport < p) ? `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--bg3);border:1px solid var(--cyan);border-radius:6px;margin-bottom:6px;">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:var(--cyan);">🏦 法人成本支撐</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:2px;">${institutionalLabel}</div>
+          <div style="font-size:10px;color:var(--text3);">近60日買超加權均價・法人不易讓股價跌破</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:14px;font-weight:800;color:var(--cyan);">NT$ ${institutionalSupport.toLocaleString()}</div>
+          <div style="font-size:10px;color:var(--text3);">${pctStr(institutionalSupport)}%（距現價）</div>
+        </div>
       </div>` : '';
+
+    const tierLabel = score >= 7.5 ? '強勢成長股（ATR基礎）'
+                    : score >= 6.0 ? '普通偏強（ATR+均線）'
+                    :                '普通/偏弱（均線+費波）';
 
     waitPriceHtml = `
     <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px;">
-      <div style="font-size:11px;font-weight:700;color:#e0f0ff;margin-bottom:8px;">⏳ 建議等待進場價位</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div style="font-size:11px;font-weight:700;color:#e0f0ff;">⏳ 建議等待進場價位</div>
+        <div style="font-size:9px;color:var(--text3);background:var(--bg3);padding:2px 6px;border-radius:4px;">${tierLabel}</div>
+      </div>
       <div style="font-size:10px;color:var(--text3);margin-bottom:10px;">時機尚未成熟，以下為回調後的合理進場參考區間（依風險偏好選擇）</div>
-      ${priceRow('積極價', 'MA20 月線支撐・小幅回調即可進場', aggressivePrice, aggressivePct, 'var(--cyan)')}
-      ${priceRow('穩健價', 'MA60 季線支撐・技術面修正充分', steadyPrice, steadyPct, 'var(--green)')}
-      ${priceRow('保守價', '費波 50% 回檔・等待更深修正', conservativePrice, conservativePct, 'var(--yellow)')}
-      <div style="font-size:10px;color:var(--text3);margin-top:6px;">💡 進場前仍需確認：RSI 回落 70 以下、週K指標不在超買區。價位僅為參考，非絕對買點。</div>
+      ${priceRow('積極價', aggressiveBasis,   aggressivePrice,   'var(--cyan)')}
+      ${priceRow('穩健價', steadyBasis,       steadyPrice,       'var(--green)')}
+      ${priceRow('保守價', conservativeBasis, conservativePrice, 'var(--yellow)')}
+      ${instRow}
+      <div style="font-size:10px;color:var(--text3);margin-top:6px;">💡 進場前仍需確認：RSI 回落 70 以下、週K指標不在超買區。法人成本為估算值，價位僅供參考。</div>
+    </div>`;
+  }
+
+  // 有等待價位時並排，沒有時單欄
+  if (waitPriceHtml) {
+    return `<div style="margin:12px 0;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start;">
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <div>
+              <div style="font-size:12px;font-weight:700;color:#e0f0ff;margin-bottom:3px;">⏱ 進場時機評分</div>
+              <div style="font-size:13px;font-weight:800;color:${grade.color};">${grade.icon} ${grade.text}</div>
+            </div>
+            <div style="position:relative;width:64px;height:64px;">
+              <svg width="64" height="64" style="transform:rotate(-90deg)">
+                <circle cx="32" cy="32" r="28" fill="none" stroke="var(--bg3)" stroke-width="6"/>
+                <circle cx="32" cy="32" r="28" fill="none" stroke="${grade.color}" stroke-width="6"
+                  stroke-dasharray="${dash.toFixed(1)} ${circum.toFixed(1)}"
+                  stroke-linecap="round"/>
+              </svg>
+              <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+                <span style="font-size:18px;font-weight:800;color:#e0f0ff;line-height:1;">${total}</span>
+                <span style="font-size:9px;color:var(--text3);">/ 100</span>
+              </div>
+            </div>
+          </div>
+          <div style="border-top:1px solid var(--border);padding-top:12px;">
+            ${rows}
+          </div>
+          <div style="font-size:10px;color:var(--text3);padding-top:8px;border-top:1px solid var(--border);">
+            💡 進場時機分評估「現在進場的時機好不好」，與左方綜合評分（股票本身好不好）互補使用。
+          </div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;">
+          ${waitPriceHtml}
+        </div>
+      </div>
     </div>`;
   }
 
@@ -2255,7 +2430,6 @@ function entryScoreCard(r) {
     <div style="font-size:10px;color:var(--text3);padding-top:8px;border-top:1px solid var(--border);">
       💡 進場時機分評估「現在進場的時機好不好」，與左方綜合評分（股票本身好不好）互補使用。
     </div>
-    ${waitPriceHtml}
   </div>`;
 }
 
