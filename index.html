@@ -323,10 +323,7 @@ input[type=range]::-webkit-slider-thumb {
 .warn-tag { display:inline-block; background:rgba(255,68,68,.12); color:var(--red); border:1px solid rgba(255,68,68,.3); border-radius:4px; padding:2px 7px; font-size:10px; font-weight:700; margin-left:6px; }
 .ok-tag   { display:inline-block; background:rgba(0,230,118,.1); color:var(--green); border:1px solid rgba(0,230,118,.3); border-radius:4px; padding:2px 7px; font-size:10px; font-weight:700; margin-left:6px; }
 
-.auto-cell { background:var(--bg3); border:1px solid var(--border2); border-radius:6px; padding:7px 9px; }
-.auto-cell .ac-label { font-size:10px; color:var(--text3); margin-bottom:3px; }
-.auto-cell .ac-val   { font-size:13px; font-weight:700; color:var(--green); }
-.auto-cell .ac-val.na{ color:var(--text3); font-style:italic; font-size:11px; }
+
 
 /* ── 第二階段：交易記錄 UI ── */
 #page-analysis  { display:block; }
@@ -488,10 +485,7 @@ input[type=range]::-webkit-slider-thumb {
       <span class="chip" id="c-margin">融資券</span>
     </div>
 
-    <div id="autoDataPanel" style="display:none; margin-top:12px;">
-      <div style="font-size:10px;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">📋 已自動抓取數據總覽</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;" id="autoDataGrid"></div>
-    </div>
+
   </div>
 
   <form onsubmit="doAnalyze(event)">
@@ -848,7 +842,6 @@ async function doFetch() {
   const myFetchId = currentFetchId;
 
   $('livePriceBox').style.display = 'none';
-  $('autoDataPanel').style.display = 'none';
 
   // 清除所有自動填入欄位
   ['revenueYoY','vsMA200','rsiVal','kdVal','macdVal',
@@ -1026,8 +1019,6 @@ async function doFetch() {
 
   const total = 6; // price, tech, chip, margin, rev, pe（最後一個背景更新）
   setStatus(`✓ 主要資料抓取完成 ${successCount}/5，PE/PB 背景更新中，請補填手動欄位後按分析`, 'success');
-  renderAutoDataPanel();
-
   $('fetchBtn').disabled = false;
 }
 
@@ -1160,7 +1151,6 @@ async function fetchPEPB(code, fetchId) {
       setChip('c-pe', 'ok');
       // 3年分位數
       await fetchPEPercentile(code, pe, fetchId);
-      renderAutoDataPanel();
     } else {
       setChip('c-pe', 'err');
     }
@@ -1199,39 +1189,6 @@ async function fetchStockName(code, fetchId) {
 /* ══════════════════════════════════════════════════════════
    自動抓取數據總覽
 ══════════════════════════════════════════════════════════ */
-function renderAutoDataPanel() {
-  const fd    = fetchedData;
-  const panel = $('autoDataPanel');
-  const grid  = $('autoDataGrid');
-
-  const items = [
-    { label:'即時股價',    val: fd.price>0                ? `NT$ ${fd.price.toLocaleString()}`        : null },
-    { label:'PE 本益比',   val: fd.pe!=null               ? `${parseFloat(fd.pe).toFixed(1)} 倍`      : null },
-    { label:'PB 淨值比',   val: fd.pb!=null               ? `${parseFloat(fd.pb).toFixed(2)} 倍`      : null },
-    { label:'PE 歷史分位', val: fd.pePercentile!=null     ? `${fd.pePercentile}%`                     : null },
-    { label:'月營收 YoY',  val: fd.revenueYoY!=null       ? `${parseFloat(fd.revenueYoY).toFixed(1)}%`: null },
-    { label:'股價相對MA200',val: fd.vsMA200!=null          ? `${parseFloat(fd.vsMA200).toFixed(1)}%`  : null },
-    { label:'RSI (14日)',  val: fd.rsi!=null               ? `${parseFloat(fd.rsi).toFixed(1)}`       : null },
-    { label:'KD 值',       val: fd.kd!=null                ? `${parseFloat(fd.kd).toFixed(1)}`        : null },
-    { label:'MACD 柱狀',   val: fd.macd!=null              ? `${parseFloat(fd.macd).toFixed(2)}`      : null },
-    { label:'外資近5日',   val: fd.foreignNet!=null        ? `${fd.foreignNet>0?'+':''}${Math.round(fd.foreignNet)} 張` : null },
-    { label:'外資近20日',  val: fd.foreignNet20!=null      ? `${fd.foreignNet20>0?'+':''}${Math.round(fd.foreignNet20)} 張` : null },
-    { label:'投信近5日',   val: fd.trustNet!=null          ? `${fd.trustNet>0?'+':''}${Math.round(fd.trustNet)} 張`    : null },
-    { label:'投信近20日',  val: fd.trustNet20!=null        ? `${fd.trustNet20>0?'+':''}${Math.round(fd.trustNet20)} 張`   : null },
-    { label:'融資變化',    val: fd.marginChg!=null         ? `${parseFloat(fd.marginChg).toFixed(1)}%`: null },
-    { label:'融券變化',    val: fd.shortChg!=null          ? `${parseFloat(fd.shortChg).toFixed(1)}%` : null },
-  ];
-
-  grid.innerHTML = items.map(item => `
-    <div class="auto-cell">
-      <div class="ac-label">${item.label}</div>
-      <div class="ac-val ${item.val?'':'na'}">${item.val || '未抓到'}</div>
-    </div>
-  `).join('');
-
-  panel.style.display = 'block';
-}
-
 /* ══════════════════════════════════════════════════════════
    評分計算（與 v3.1 完全一致）
 ══════════════════════════════════════════════════════════ */
