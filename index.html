@@ -2365,6 +2365,24 @@ function entryScoreCard(r) {
       ${priceRow('保守價', conservativeBasis, conservativePrice, 'var(--yellow)')}
       ${instRow}
       <div style="font-size:10px;color:var(--text3);margin-top:6px;">💡 進場前仍需確認：RSI 回落 70 以下、週K指標不在超買區。法人成本為估算值，價位僅供參考。</div>
+      ${(r.ma5||r.ma10||r.ma20||r.ma60) ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+        <div style="font-size:10px;font-weight:700;color:var(--text3);margin-bottom:6px;letter-spacing:.5px;">📊 均線參考（與上方價位對照）</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;">
+          ${[['MA5','月線(週)','ma5'],['MA10','雙週線','ma10'],['MA20','月線','ma20'],['MA60','季線','ma60']].map(([label,sub,key]) => {
+            const val = r[key];
+            if (!val) return '';
+            const diff = ((val - r.price) / r.price * 100).toFixed(1);
+            const color = val < r.price ? 'var(--green)' : 'var(--red)';
+            return `<div style="background:var(--bg3);border-radius:6px;padding:6px 8px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:${color};">${label}</div>
+              <div style="font-size:9px;color:var(--text3);margin-bottom:3px;">${sub}</div>
+              <div style="font-size:12px;font-weight:800;color:${color};">NT$ ${Math.round(val).toLocaleString()}</div>
+              <div style="font-size:9px;color:var(--text3);">${diff}%</div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>` : ''}
     </div>`;
   }
 
