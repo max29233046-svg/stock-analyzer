@@ -1029,9 +1029,13 @@ async function doFetch() {
 function summarizeInstitutional(rows) {
   if (!rows || rows.length === 0) return {error: '無資料'};
 
-  // 降冪排序，取最新 15 筆（5日 × 3法人）
+  // 降冪排序（最新在前）
   rows.sort((a, b) => a.date > b.date ? -1 : 1);
-  const recent = rows.slice(0, 15);
+
+  // FinMind 每天回傳 5 筆（外資及陸資、外資及陸資(不含自營商)、投信、自營商(自行買賣)、自營商(避險)）
+  // 用 Set 取最新 5 個不重複交易日，避免 slice(0,15) 只抓到約 3 天
+  const dates = [...new Set(rows.map(r => r.date))].slice(0, 5);
+  const recent = rows.filter(r => dates.includes(r.date));
 
   let foreign = 0, invest = 0, dealer = 0;
 
@@ -1039,15 +1043,17 @@ function summarizeInstitutional(rows) {
     const buy  = parseInt(r.buy  || 0, 10);
     const sell = parseInt(r.sell || 0, 10);
     const net  = buy - sell;
-    const name = r.name || r.institution_name || '';
+    // 精確比對，避免「外資及陸資(不含自營商)」被重複計入
+    const name = (r.name || r.institution_name || '').trim();
 
-    if (name === '外資及陸資' || name.includes('外資') || name.toLowerCase().includes('foreign')) {
+    if (name === '外資及陸資') {
       foreign += net;
-    } else if (name === '投信' || name.includes('投信') || name.toLowerCase().includes('investment')) {
+    } else if (name === '投信') {
       invest += net;
-    } else if (name === '自營商' || name.includes('自營') || name.toLowerCase().includes('dealer')) {
+    } else if (name === '自營商' || name === '自營商(自行買賣)') {
       dealer += net;
     }
+    // 「外資及陸資(不含自營商)」「自營商(避險)」略過，避免重複加總
   });
 
   return {
