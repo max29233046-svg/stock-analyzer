@@ -1436,6 +1436,8 @@ function doAnalyze(e) {
     // 法人加權持股成本（calcInstitutionalCost 計算結果）
     foreignCost:  fetchedData.foreignCost  || null,
     trustCost:    fetchedData.trustCost    || null,
+    // v3.4：近10天DIF序列，供出場訊號頂背離偵測
+    macdDIFHistory: fetchedData.techRaw ? (fetchedData.techRaw.macdDIFHistory || null) : null,
   };
 
   const scores  = computeScores(data);
@@ -1491,6 +1493,8 @@ function renderResult(r) {
   </div>
 
   ${entryScoreCard(r)}
+
+  ${exitSignalCard(r)}
 
   <button class="record-btn" onclick="openRecordFromAnalysis()">📝 記錄此筆交易進場</button>
 
@@ -2454,8 +2458,257 @@ function entryScoreCard(r) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   小元件（與 v3.1 相同）
+   出場訊號評估（v3.4 新增）
+   邏輯：技術過熱程度 × 成長性保護係數
 ══════════════════════════════════════════════════════════ */
+function calcExitSignal(r) {
+  const p        = r.price;
+  const atr      = r.atr14 || 0;
+  const wt       = r.weeklyTech || {};
+  const fundScore = parseFloat(r.scores ? r.scores.total : 0);
+  const futureEps = r.futureEps || 0;
+
+  // ── 1. 技術過熱偵測（7項，各1分）──────────────────────────
+  const heatItems = [];
+
+  // 日RSI
+  const rsi = r.rsi;
+  heatItems.push({
+    label: '日RSI過熱',
+    hit: rsi != null && rsi >= 80,
+    detail: rsi != null ? `日RSI = ${fmtNum(rsi)}（門檻 ≥ 80）` : '資料不足'
+  });
+
+  // 日KD
+  const kd = r.kd;
+  heatItems.push({
+    label: '日KD過熱',
+    hit: kd != null && kd >= 85,
+    detail: kd != null ? `日KD(K) = ${fmtNum(kd)}（門檻 ≥ 85）` : '資料不足'
+  });
+
+  // 週RSI
+  const wRsi = wt.weekRsi14;
+  heatItems.push({
+    label: '週RSI過熱',
+    hit: wRsi != null && wRsi >= 75,
+    detail: wRsi != null ? `週RSI = ${fmtNum(wRsi)}（門檻 ≥ 75）` : '週K資料不足'
+  });
+
+  // 週KD
+  const wK = wt.weekK;
+  heatItems.push({
+    label: '週KD過熱',
+    hit: wK != null && wK >= 80,
+    detail: wK != null ? `週KD(K) = ${fmtNum(wK)}（門檻 ≥ 80）` : '週K資料不足'
+  });
+
+  // 距MA20漲幅
+  const vsMA20 = r.ma20 && p ? (p - r.ma20) / r.ma20 * 100 : null;
+  heatItems.push({
+    label: '乖離MA20過大',
+    hit: vsMA20 != null && vsMA20 >= 15,
+    detail: vsMA20 != null ? `股價高於MA20 ${vsMA20.toFixed(1)}%（門檻 ≥ 15%）` : '均線資料不足'
+  });
+
+  // 接近52週高點（年內位置≥90%）
+  const hi52 = r.weekHigh52, lo52 = r.weekLow52;
+  const pos52 = (p && hi52 && lo52 && hi52 > lo52) ? (p - lo52) / (hi52 - lo52) * 100 : null;
+  heatItems.push({
+    label: '接近年度高點',
+    hit: pos52 != null && pos52 >= 90,
+    detail: pos52 != null ? `年內位置 ${pos52.toFixed(0)}%（門檻 ≥ 90%）` : '52週資料不足'
+  });
+
+  // MACD頂背離（近5天DIF均值 < 前5天DIF均值，且股價上漲）
+  const difHist = r.macdDIFHistory; // 長度11：index 0~4 = 較舊5天，5~10 = 近5天，10 = 今天
+  let divergenceHit = false;
+  let divergenceDetail = 'DIF歷史資料不足';
+  if (difHist && difHist.length >= 10) {
+    const older = difHist.slice(0, 5);
+    const newer = difHist.slice(5);
+    const avgOlder = older.reduce((a, b) => a + b, 0) / older.length;
+    const avgNewer = newer.reduce((a, b) => a + b, 0) / newer.length;
+    const priceUp  = r.prev && p ? p > r.prev : false;
+    divergenceHit   = priceUp && avgNewer < avgOlder && avgOlder > 0;
+    const difToday  = difHist[difHist.length - 1];
+    divergenceDetail = `DIF今日=${fmtNum(difToday,2)}・近5日均=${fmtNum(avgNewer,2)}・前5日均=${fmtNum(avgOlder,2)}${divergenceHit ? '・⚠️ 動能衰退' : ''}`;
+  }
+  heatItems.push({
+    label: 'MACD頂背離',
+    hit: divergenceHit,
+    detail: divergenceDetail
+  });
+
+  const heatScore = heatItems.filter(i => i.hit).length; // 0~7
+
+  // ── 2. 成長性保護係數 ──────────────────────────────────────
+  // 基本面分取三維總分的基本面子分（這裡用總分作為代理，後續可細化）
+  // futureEps 為手動填入的未來12月EPS成長預估（%）
+  const isStrongGrowth  = fundScore >= 8.0 && futureEps >= 20;
+  const isMediumGrowth  = fundScore >= 7.0 && futureEps >= 10;
+  // 否則為無保護
+
+  let growthLevel, growthLabel, growthColor;
+  if (isStrongGrowth) {
+    growthLevel = 'strong'; growthLabel = '強成長保護'; growthColor = 'var(--green)';
+  } else if (isMediumGrowth) {
+    growthLevel = 'medium'; growthLabel = '中等成長保護'; growthColor = 'var(--cyan)';
+  } else {
+    growthLevel = 'none';   growthLabel = '成長保護有限'; growthColor = 'var(--yellow)';
+  }
+
+  // ── 3. 判斷最終結論 ───────────────────────────────────────
+  let verdict, verdictColor, verdictIcon, action;
+
+  if (heatScore <= 2) {
+    verdict      = '持倉安全';
+    verdictColor = 'var(--green)';
+    verdictIcon  = '🟢';
+    action       = '技術面尚未過熱，繼續持倉觀察';
+  } else if (heatScore <= 4 && growthLevel === 'strong') {
+    verdict      = '過熱但強勢，續抱';
+    verdictColor = 'var(--cyan)';
+    verdictIcon  = '🔵';
+    action       = '成長性強力支撐，設移動停利，不輕易出場';
+  } else if (heatScore <= 4 && growthLevel === 'medium') {
+    verdict      = '考慮減倉觀察';
+    verdictColor = 'var(--yellow)';
+    verdictIcon  = '🟡';
+    action       = '建議減倉 1/3，剩餘主倉設移動停利繼續持守';
+  } else if (heatScore <= 4) {
+    verdict      = '技術過熱，考慮減倉';
+    verdictColor = 'var(--yellow)';
+    verdictIcon  = '🟡';
+    action       = '成長性偏弱，建議減倉 1/2，密切觀察後續';
+  } else if (heatScore >= 5 && growthLevel === 'strong') {
+    verdict      = '嚴重過熱，但基本面撐';
+    verdictColor = 'var(--yellow)';
+    verdictIcon  = '🟡';
+    action       = '建議減倉 1/2，剩餘持守但設嚴格移動停利（現價 − 1×ATR）';
+  } else {
+    verdict      = '建議分批出場';
+    verdictColor = 'var(--red)';
+    verdictIcon  = '🔴';
+    action       = '多項指標共振過熱且成長保護不足，建議分批出場或等下一根K棒確認';
+  }
+
+  // ── 4. 出場價格參考線 ────────────────────────────────────
+  // 移動停利線：現價 − ATR×1.5
+  const trailStop    = (atr > 0 && p) ? Math.round(p - atr * 1.5) : null;
+  const trailStopPct = (trailStop && p) ? ((trailStop - p) / p * 100).toFixed(1) : null;
+
+  // 積極出場：第一壓力位（≥現價，最近的）
+  const pressureCandidates = [r.ma20, r.ma60, r.ma120, r.ma200, hi52]
+    .filter(v => v != null && v > p)
+    .sort((a, b) => a - b);
+  const exitTarget1    = pressureCandidates.length > 0 ? pressureCandidates[0] : null;
+  const exitTarget1Pct = (exitTarget1 && p) ? ((exitTarget1 - p) / p * 100).toFixed(1) : null;
+
+  // 穩健出場：第二壓力位
+  const exitTarget2    = pressureCandidates.length > 1 ? pressureCandidates[1] : null;
+  const exitTarget2Pct = (exitTarget2 && p) ? ((exitTarget2 - p) / p * 100).toFixed(1) : null;
+
+  return {
+    heatScore, heatItems,
+    growthLevel, growthLabel, growthColor,
+    verdict, verdictColor, verdictIcon, action,
+    trailStop, trailStopPct,
+    exitTarget1, exitTarget1Pct,
+    exitTarget2, exitTarget2Pct
+  };
+}
+
+function exitSignalCard(r) {
+  const es = calcExitSignal(r);
+
+  // 過熱計數器顏色
+  const heatColor = es.heatScore <= 2 ? 'var(--green)'
+                  : es.heatScore <= 4 ? 'var(--yellow)'
+                  : 'var(--red)';
+
+  // 過熱指標列表
+  const heatRows = es.heatItems.map(item => {
+    const hitIcon = item.hit ? '🔴' : '⚪';
+    const txtColor = item.hit ? 'var(--red)' : 'var(--text3)';
+    return `<div style="display:flex;align-items:flex-start;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);">
+      <span style="font-size:13px;flex-shrink:0;margin-top:1px;">${hitIcon}</span>
+      <div>
+        <div style="font-size:11px;font-weight:700;color:${item.hit ? 'var(--text1)' : 'var(--text3)'};">${item.label}</div>
+        <div style="font-size:10px;color:${txtColor};margin-top:1px;">${item.detail}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // 出場價格參考線
+  const priceLineRow = (label, price, pct, color, note) => {
+    if (!price) return '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:var(--bg3);border-radius:6px;margin-bottom:5px;">
+      <div>
+        <div style="font-size:11px;font-weight:700;color:${color};">${label}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:1px;">${note}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-size:14px;font-weight:800;color:${color};">NT$ ${price.toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--text3);">${pct}%（距現價）</div>
+      </div>
+    </div>`;
+  };
+
+  // 成長性保護標籤
+  const growthBadge = `<span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;
+    background:${es.growthColor}22;color:${es.growthColor};border:1px solid ${es.growthColor}44;">
+    ${es.growthLabel}（三維總分 ${r.scores ? parseFloat(r.scores.total).toFixed(1) : '—'} ／ 預期EPS成長 ${r.futureEps || 0}%）
+  </span>`;
+
+  return `
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:12px;">
+
+    <!-- 標題列 -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+      <div>
+        <div style="font-size:12px;font-weight:700;color:#e0f0ff;margin-bottom:3px;">🚨 出場訊號評估</div>
+        <div style="font-size:13px;font-weight:800;color:${es.verdictColor};">${es.verdictIcon} ${es.verdict}</div>
+      </div>
+      <div style="text-align:center;">
+        <div style="font-size:28px;font-weight:900;color:${heatColor};line-height:1;">${es.heatScore}</div>
+        <div style="font-size:9px;color:var(--text3);">/ 7 項過熱</div>
+      </div>
+    </div>
+
+    <!-- 操作建議 -->
+    <div style="background:${es.verdictColor}15;border-left:3px solid ${es.verdictColor};border-radius:0 6px 6px 0;
+      padding:8px 12px;margin-bottom:12px;font-size:11px;color:var(--text2);">
+      ${es.action}
+    </div>
+
+    <!-- 成長性保護 -->
+    <div style="margin-bottom:12px;">${growthBadge}</div>
+
+    <!-- 過熱指標明細 -->
+    <div style="margin-bottom:14px;">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:6px;font-weight:600;">
+        技術過熱偵測（${es.heatScore}/7 項觸發）
+      </div>
+      ${heatRows}
+    </div>
+
+    <!-- 出場價格參考線 -->
+    <div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:6px;font-weight:600;">📌 出場價格參考</div>
+      ${priceLineRow('移動停利線', es.trailStop, es.trailStopPct, 'var(--yellow)', '現價 − 1.5×ATR，持倉心理防線，跌破考慮出場')}
+      ${priceLineRow('積極出場參考', es.exitTarget1, es.exitTarget1Pct, 'var(--cyan)', '最近第一壓力位（MA或52週高點），可先減倉')}
+      ${priceLineRow('穩健出場參考', es.exitTarget2, es.exitTarget2Pct, 'var(--green)', '第二壓力位，強勢股可持守至此再出場')}
+      ${(!es.trailStop && !es.exitTarget1) ? '<div style="font-size:11px;color:var(--text3);text-align:center;padding:8px;">需要 ATR 與均線資料才能計算出場價位</div>' : ''}
+    </div>
+
+    <div style="font-size:10px;color:var(--text3);padding-top:8px;border-top:1px solid var(--border);margin-top:10px;">
+      💡 出場訊號為動態計算，每次重新分析時更新。過熱 ≥ 3 項才有出場意義，成長性強時不宜輕易賣飛。
+    </div>
+  </div>`;
+}
+
+
 function stratCard(title, a) {
   return `<div class="strat-card">
     <div class="sc-title">${title}</div>
