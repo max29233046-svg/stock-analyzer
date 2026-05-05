@@ -448,10 +448,11 @@ input[type=range]::-webkit-slider-thumb {
       <button class="htab active" onclick="switchPage('analysis',this)">📊 分析</button>
       <button class="htab" onclick="switchPage('trades',this)">📋 交易記錄</button>
       <button class="htab" onclick="switchPage('positions',this)">💼 持倉追蹤</button>
+      <button class="htab" onclick="switchPage('notes',this)">📒 個股備忘</button>
     </div>
     <div style="display:flex;align-items:center;gap:8px;">
       <button onclick="openTokenModal(false)" style="background:var(--bg3);border:1px solid var(--border2);color:var(--text2);border-radius:6px;padding:5px 10px;font-size:11px;cursor:pointer;" title="設定 FinMind Token">⚙️ Token</button>
-      <span class="hbadge">v3.3</span>
+      <span class="hbadge">v3.4</span>
     </div>
   </div>
 </div>
@@ -599,6 +600,26 @@ input[type=range]::-webkit-slider-thumb {
     </div>
     <div id="positionContent">
       <div style="color:var(--text3);text-align:center;padding:60px;">點擊重新整理載入持倉</div>
+    </div>
+  </div>
+</div>
+
+<!-- 頁面四：個股備忘 -->
+<div id="page-notes" style="display:none;">
+  <div class="trade-page">
+    <div class="page-header">
+      <h2>📒 個股備忘</h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="search-btn" onclick="renderNotesPage()" style="background:var(--bg3);">🔄 重新整理</button>
+        <button class="search-btn" onclick="clearAllNotes()" style="background:rgba(239,68,68,.15);color:var(--red);border-color:var(--red);">🗑 清除全部</button>
+      </div>
+    </div>
+    <div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:11px;color:var(--text2);line-height:1.7;">
+      💡 此處儲存每支個股的<strong style="color:#e0f0ff">手動填寫欄位</strong>（淨利成長、毛利率變化、ROIC、預期EPS成長、景氣能見度、風險評分）。<br>
+      輸入股票代號並按分析時，系統會自動帶入最近一次儲存的數值。資料儲存於瀏覽器本機（localStorage），清除瀏覽器資料會一併刪除。
+    </div>
+    <div id="notesContent">
+      <div style="color:var(--text3);text-align:center;padding:60px;">尚無儲存記錄</div>
     </div>
   </div>
 </div>
@@ -761,10 +782,11 @@ async function fmFetch(dataset, stockId, startDaysAgo, endDate) {
    頁面切換
 ══════════════════════════════════════════════════════════ */
 function switchPage(page, btn) {
-  ['page-analysis','page-trades','page-positions'].forEach(id => $(id).style.display='none');
+  ['page-analysis','page-trades','page-positions','page-notes'].forEach(id => $(id).style.display='none');
   $('page-' + page).style.display = 'block';
   document.querySelectorAll('.htab').forEach(el => el.classList.remove('active'));
   if(btn) btn.classList.add('active');
+  if(page === 'notes') renderNotesPage();
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1038,6 +1060,9 @@ async function doFetch() {
   const total = 6; // price, tech, chip, margin, rev, pe（最後一個背景更新）
   setStatus(`✓ 主要資料抓取完成 ${successCount}/5，PE/PB 背景更新中，請補填手動欄位後按分析`, 'success');
   $('fetchBtn').disabled = false;
+
+  // v3.4：從 localStorage 自動帶入手動欄位
+  autoFillFromNote(code);
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1436,8 +1461,6 @@ function doAnalyze(e) {
     // 法人加權持股成本（calcInstitutionalCost 計算結果）
     foreignCost:  fetchedData.foreignCost  || null,
     trustCost:    fetchedData.trustCost    || null,
-    // v3.4：近10天DIF序列，供出場訊號頂背離偵測
-    macdDIFHistory: fetchedData.techRaw ? (fetchedData.techRaw.macdDIFHistory || null) : null,
   };
 
   const scores  = computeScores(data);
@@ -1448,6 +1471,9 @@ function doAnalyze(e) {
   lastAnalysisResult = result;
   stocks.unshift(result);
   renderResult(result);
+
+  // v3.4：自動儲存手動填寫欄位到 localStorage
+  saveStockNote(code, data);
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1493,8 +1519,6 @@ function renderResult(r) {
   </div>
 
   ${entryScoreCard(r)}
-
-  ${exitSignalCard(r)}
 
   <button class="record-btn" onclick="openRecordFromAnalysis()">📝 記錄此筆交易進場</button>
 
@@ -2458,257 +2482,8 @@ function entryScoreCard(r) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   出場訊號評估（v3.4 新增）
-   邏輯：技術過熱程度 × 成長性保護係數
+   小元件（與 v3.1 相同）
 ══════════════════════════════════════════════════════════ */
-function calcExitSignal(r) {
-  const p        = r.price;
-  const atr      = r.atr14 || 0;
-  const wt       = r.weeklyTech || {};
-  const fundScore = parseFloat(r.scores ? r.scores.total : 0);
-  const futureEps = r.futureEps || 0;
-
-  // ── 1. 技術過熱偵測（7項，各1分）──────────────────────────
-  const heatItems = [];
-
-  // 日RSI
-  const rsi = r.rsi;
-  heatItems.push({
-    label: '日RSI過熱',
-    hit: rsi != null && rsi >= 80,
-    detail: rsi != null ? `日RSI = ${fmtNum(rsi)}（門檻 ≥ 80）` : '資料不足'
-  });
-
-  // 日KD
-  const kd = r.kd;
-  heatItems.push({
-    label: '日KD過熱',
-    hit: kd != null && kd >= 85,
-    detail: kd != null ? `日KD(K) = ${fmtNum(kd)}（門檻 ≥ 85）` : '資料不足'
-  });
-
-  // 週RSI
-  const wRsi = wt.weekRsi14;
-  heatItems.push({
-    label: '週RSI過熱',
-    hit: wRsi != null && wRsi >= 75,
-    detail: wRsi != null ? `週RSI = ${fmtNum(wRsi)}（門檻 ≥ 75）` : '週K資料不足'
-  });
-
-  // 週KD
-  const wK = wt.weekK;
-  heatItems.push({
-    label: '週KD過熱',
-    hit: wK != null && wK >= 80,
-    detail: wK != null ? `週KD(K) = ${fmtNum(wK)}（門檻 ≥ 80）` : '週K資料不足'
-  });
-
-  // 距MA20漲幅
-  const vsMA20 = r.ma20 && p ? (p - r.ma20) / r.ma20 * 100 : null;
-  heatItems.push({
-    label: '乖離MA20過大',
-    hit: vsMA20 != null && vsMA20 >= 15,
-    detail: vsMA20 != null ? `股價高於MA20 ${vsMA20.toFixed(1)}%（門檻 ≥ 15%）` : '均線資料不足'
-  });
-
-  // 接近52週高點（年內位置≥90%）
-  const hi52 = r.weekHigh52, lo52 = r.weekLow52;
-  const pos52 = (p && hi52 && lo52 && hi52 > lo52) ? (p - lo52) / (hi52 - lo52) * 100 : null;
-  heatItems.push({
-    label: '接近年度高點',
-    hit: pos52 != null && pos52 >= 90,
-    detail: pos52 != null ? `年內位置 ${pos52.toFixed(0)}%（門檻 ≥ 90%）` : '52週資料不足'
-  });
-
-  // MACD頂背離（近5天DIF均值 < 前5天DIF均值，且股價上漲）
-  const difHist = r.macdDIFHistory; // 長度11：index 0~4 = 較舊5天，5~10 = 近5天，10 = 今天
-  let divergenceHit = false;
-  let divergenceDetail = 'DIF歷史資料不足';
-  if (difHist && difHist.length >= 10) {
-    const older = difHist.slice(0, 5);
-    const newer = difHist.slice(5);
-    const avgOlder = older.reduce((a, b) => a + b, 0) / older.length;
-    const avgNewer = newer.reduce((a, b) => a + b, 0) / newer.length;
-    const priceUp  = r.prev && p ? p > r.prev : false;
-    divergenceHit   = priceUp && avgNewer < avgOlder && avgOlder > 0;
-    const difToday  = difHist[difHist.length - 1];
-    divergenceDetail = `DIF今日=${fmtNum(difToday,2)}・近5日均=${fmtNum(avgNewer,2)}・前5日均=${fmtNum(avgOlder,2)}${divergenceHit ? '・⚠️ 動能衰退' : ''}`;
-  }
-  heatItems.push({
-    label: 'MACD頂背離',
-    hit: divergenceHit,
-    detail: divergenceDetail
-  });
-
-  const heatScore = heatItems.filter(i => i.hit).length; // 0~7
-
-  // ── 2. 成長性保護係數 ──────────────────────────────────────
-  // 基本面分取三維總分的基本面子分（這裡用總分作為代理，後續可細化）
-  // futureEps 為手動填入的未來12月EPS成長預估（%）
-  const isStrongGrowth  = fundScore >= 8.0 && futureEps >= 20;
-  const isMediumGrowth  = fundScore >= 7.0 && futureEps >= 10;
-  // 否則為無保護
-
-  let growthLevel, growthLabel, growthColor;
-  if (isStrongGrowth) {
-    growthLevel = 'strong'; growthLabel = '強成長保護'; growthColor = 'var(--green)';
-  } else if (isMediumGrowth) {
-    growthLevel = 'medium'; growthLabel = '中等成長保護'; growthColor = 'var(--cyan)';
-  } else {
-    growthLevel = 'none';   growthLabel = '成長保護有限'; growthColor = 'var(--yellow)';
-  }
-
-  // ── 3. 判斷最終結論 ───────────────────────────────────────
-  let verdict, verdictColor, verdictIcon, action;
-
-  if (heatScore <= 2) {
-    verdict      = '持倉安全';
-    verdictColor = 'var(--green)';
-    verdictIcon  = '🟢';
-    action       = '技術面尚未過熱，繼續持倉觀察';
-  } else if (heatScore <= 4 && growthLevel === 'strong') {
-    verdict      = '過熱但強勢，續抱';
-    verdictColor = 'var(--cyan)';
-    verdictIcon  = '🔵';
-    action       = '成長性強力支撐，設移動停利，不輕易出場';
-  } else if (heatScore <= 4 && growthLevel === 'medium') {
-    verdict      = '考慮減倉觀察';
-    verdictColor = 'var(--yellow)';
-    verdictIcon  = '🟡';
-    action       = '建議減倉 1/3，剩餘主倉設移動停利繼續持守';
-  } else if (heatScore <= 4) {
-    verdict      = '技術過熱，考慮減倉';
-    verdictColor = 'var(--yellow)';
-    verdictIcon  = '🟡';
-    action       = '成長性偏弱，建議減倉 1/2，密切觀察後續';
-  } else if (heatScore >= 5 && growthLevel === 'strong') {
-    verdict      = '嚴重過熱，但基本面撐';
-    verdictColor = 'var(--yellow)';
-    verdictIcon  = '🟡';
-    action       = '建議減倉 1/2，剩餘持守但設嚴格移動停利（現價 − 1×ATR）';
-  } else {
-    verdict      = '建議分批出場';
-    verdictColor = 'var(--red)';
-    verdictIcon  = '🔴';
-    action       = '多項指標共振過熱且成長保護不足，建議分批出場或等下一根K棒確認';
-  }
-
-  // ── 4. 出場價格參考線 ────────────────────────────────────
-  // 移動停利線：現價 − ATR×1.5
-  const trailStop    = (atr > 0 && p) ? Math.round(p - atr * 1.5) : null;
-  const trailStopPct = (trailStop && p) ? ((trailStop - p) / p * 100).toFixed(1) : null;
-
-  // 積極出場：第一壓力位（≥現價，最近的）
-  const pressureCandidates = [r.ma20, r.ma60, r.ma120, r.ma200, hi52]
-    .filter(v => v != null && v > p)
-    .sort((a, b) => a - b);
-  const exitTarget1    = pressureCandidates.length > 0 ? pressureCandidates[0] : null;
-  const exitTarget1Pct = (exitTarget1 && p) ? ((exitTarget1 - p) / p * 100).toFixed(1) : null;
-
-  // 穩健出場：第二壓力位
-  const exitTarget2    = pressureCandidates.length > 1 ? pressureCandidates[1] : null;
-  const exitTarget2Pct = (exitTarget2 && p) ? ((exitTarget2 - p) / p * 100).toFixed(1) : null;
-
-  return {
-    heatScore, heatItems,
-    growthLevel, growthLabel, growthColor,
-    verdict, verdictColor, verdictIcon, action,
-    trailStop, trailStopPct,
-    exitTarget1, exitTarget1Pct,
-    exitTarget2, exitTarget2Pct
-  };
-}
-
-function exitSignalCard(r) {
-  const es = calcExitSignal(r);
-
-  // 過熱計數器顏色
-  const heatColor = es.heatScore <= 2 ? 'var(--green)'
-                  : es.heatScore <= 4 ? 'var(--yellow)'
-                  : 'var(--red)';
-
-  // 過熱指標列表
-  const heatRows = es.heatItems.map(item => {
-    const hitIcon = item.hit ? '🔴' : '⚪';
-    const txtColor = item.hit ? 'var(--red)' : 'var(--text3)';
-    return `<div style="display:flex;align-items:flex-start;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:13px;flex-shrink:0;margin-top:1px;">${hitIcon}</span>
-      <div>
-        <div style="font-size:11px;font-weight:700;color:${item.hit ? 'var(--text1)' : 'var(--text3)'};">${item.label}</div>
-        <div style="font-size:10px;color:${txtColor};margin-top:1px;">${item.detail}</div>
-      </div>
-    </div>`;
-  }).join('');
-
-  // 出場價格參考線
-  const priceLineRow = (label, price, pct, color, note) => {
-    if (!price) return '';
-    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:var(--bg3);border-radius:6px;margin-bottom:5px;">
-      <div>
-        <div style="font-size:11px;font-weight:700;color:${color};">${label}</div>
-        <div style="font-size:10px;color:var(--text3);margin-top:1px;">${note}</div>
-      </div>
-      <div style="text-align:right;">
-        <div style="font-size:14px;font-weight:800;color:${color};">NT$ ${price.toLocaleString()}</div>
-        <div style="font-size:10px;color:var(--text3);">${pct}%（距現價）</div>
-      </div>
-    </div>`;
-  };
-
-  // 成長性保護標籤
-  const growthBadge = `<span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;
-    background:${es.growthColor}22;color:${es.growthColor};border:1px solid ${es.growthColor}44;">
-    ${es.growthLabel}（三維總分 ${r.scores ? parseFloat(r.scores.total).toFixed(1) : '—'} ／ 預期EPS成長 ${r.futureEps || 0}%）
-  </span>`;
-
-  return `
-  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:12px;">
-
-    <!-- 標題列 -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-      <div>
-        <div style="font-size:12px;font-weight:700;color:#e0f0ff;margin-bottom:3px;">🚨 出場訊號評估</div>
-        <div style="font-size:13px;font-weight:800;color:${es.verdictColor};">${es.verdictIcon} ${es.verdict}</div>
-      </div>
-      <div style="text-align:center;">
-        <div style="font-size:28px;font-weight:900;color:${heatColor};line-height:1;">${es.heatScore}</div>
-        <div style="font-size:9px;color:var(--text3);">/ 7 項過熱</div>
-      </div>
-    </div>
-
-    <!-- 操作建議 -->
-    <div style="background:${es.verdictColor}15;border-left:3px solid ${es.verdictColor};border-radius:0 6px 6px 0;
-      padding:8px 12px;margin-bottom:12px;font-size:11px;color:var(--text2);">
-      ${es.action}
-    </div>
-
-    <!-- 成長性保護 -->
-    <div style="margin-bottom:12px;">${growthBadge}</div>
-
-    <!-- 過熱指標明細 -->
-    <div style="margin-bottom:14px;">
-      <div style="font-size:11px;color:var(--text3);margin-bottom:6px;font-weight:600;">
-        技術過熱偵測（${es.heatScore}/7 項觸發）
-      </div>
-      ${heatRows}
-    </div>
-
-    <!-- 出場價格參考線 -->
-    <div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:6px;font-weight:600;">📌 出場價格參考</div>
-      ${priceLineRow('移動停利線', es.trailStop, es.trailStopPct, 'var(--yellow)', '現價 − 1.5×ATR，持倉心理防線，跌破考慮出場')}
-      ${priceLineRow('積極出場參考', es.exitTarget1, es.exitTarget1Pct, 'var(--cyan)', '最近第一壓力位（MA或52週高點），可先減倉')}
-      ${priceLineRow('穩健出場參考', es.exitTarget2, es.exitTarget2Pct, 'var(--green)', '第二壓力位，強勢股可持守至此再出場')}
-      ${(!es.trailStop && !es.exitTarget1) ? '<div style="font-size:11px;color:var(--text3);text-align:center;padding:8px;">需要 ATR 與均線資料才能計算出場價位</div>' : ''}
-    </div>
-
-    <div style="font-size:10px;color:var(--text3);padding-top:8px;border-top:1px solid var(--border);margin-top:10px;">
-      💡 出場訊號為動態計算，每次重新分析時更新。過熱 ≥ 3 項才有出場意義，成長性強時不宜輕易賣飛。
-    </div>
-  </div>`;
-}
-
-
 function stratCard(title, a) {
   return `<div class="strat-card">
     <div class="sc-title">${title}</div>
@@ -3011,6 +2786,208 @@ function closeModal(id) { $(id).classList.remove('show'); }
 document.querySelectorAll('.modal-overlay').forEach(el => {
   el.addEventListener('click', e => { if(e.target === el) el.classList.remove('show'); });
 });
+
+/* ══════════════════════════════════════════════════════════
+   個股備忘：localStorage 管理（v3.4）
+   儲存格式：localStorage key = 'stockNote_XXXX'
+   value = JSON { netProfitYoY, marginChange, roic,
+                  futureEps, bizCycle, riskScore,
+                  savedAt, name }
+══════════════════════════════════════════════════════════ */
+const NOTE_PREFIX = 'stockNote_';
+
+// 手動欄位清單（id → label）
+const MANUAL_FIELDS = [
+  { id: 'netProfitYoY', label: '淨利成長 YoY (%)',    type: 'number' },
+  { id: 'marginChange', label: '毛利率變化 (%)',        type: 'number' },
+  { id: 'roic',         label: 'ROIC (%)',              type: 'number' },
+  { id: 'futureEps',   label: '預期12月EPS成長 (%)',   type: 'number' },
+  { id: 'bizCycle',    label: '景氣能見度 (1-10)',      type: 'range'  },
+  { id: 'riskScore',   label: '風險評分 (1-10)',        type: 'range'  },
+];
+
+// 儲存當次分析的手動欄位
+function saveStockNote(code, data) {
+  if (!code) return;
+  const note = {
+    netProfitYoY: data.netProfitYoY,
+    marginChange:  data.marginChange,
+    roic:          data.roic,
+    futureEps:     data.futureEps,
+    bizCycle:      data.bizCycle,
+    riskScore:     data.riskScore,
+    name:          fetchedData.name || code,
+    savedAt:       new Date().toLocaleString('zh-TW'),
+  };
+  try {
+    localStorage.setItem(NOTE_PREFIX + code, JSON.stringify(note));
+  } catch(e) { console.error('[saveStockNote]', e); }
+}
+
+// 讀取某支股票的備忘
+function loadStockNote(code) {
+  try {
+    const raw = localStorage.getItem(NOTE_PREFIX + code);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) { return null; }
+}
+
+// 取得所有備忘記錄
+function getAllNotes() {
+  const notes = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(NOTE_PREFIX)) {
+        const code = key.replace(NOTE_PREFIX, '');
+        const raw  = localStorage.getItem(key);
+        if (raw) {
+          try { notes.push({ code, ...JSON.parse(raw) }); } catch(e) {}
+        }
+      }
+    }
+  } catch(e) {}
+  return notes.sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''));
+}
+
+// 刪除單筆備忘
+function deleteStockNote(code) {
+  if (!confirm(`確定刪除 ${code} 的備忘記錄？`)) return;
+  localStorage.removeItem(NOTE_PREFIX + code);
+  renderNotesPage();
+}
+
+// 清除全部備忘
+function clearAllNotes() {
+  if (!confirm('確定清除所有個股備忘？此操作不可復原。')) return;
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(NOTE_PREFIX)) keys.push(key);
+  }
+  keys.forEach(k => localStorage.removeItem(k));
+  renderNotesPage();
+}
+
+// 抓取完畢後自動帶入手動欄位（帶入後欄位閃黃提示）
+function autoFillFromNote(code) {
+  const note = loadStockNote(code);
+  if (!note) return;
+
+  let filled = 0;
+  MANUAL_FIELDS.forEach(f => {
+    const val = note[f.id];
+    if (val == null) return;
+    const el = $(f.id);
+    if (!el) return;
+    el.value = val;
+    // range 同步更新顯示數字
+    if (f.type === 'range') {
+      const sv = el.id === 'bizCycle' ? $('sv1') : $('sv2');
+      if (sv) sv.textContent = val;
+    }
+    // 閃黃提示
+    el.style.transition = 'border-color 0.3s, box-shadow 0.3s';
+    el.style.borderColor = '#f59e0b';
+    el.style.boxShadow   = '0 0 0 2px rgba(245,158,11,0.3)';
+    setTimeout(() => {
+      el.style.borderColor = '';
+      el.style.boxShadow   = '';
+    }, 1800);
+    filled++;
+  });
+
+  if (filled > 0) {
+    // 在 status bar 補充提示
+    const bar = $('statusBar');
+    if (bar) {
+      const old = bar.textContent;
+      bar.textContent = old + `　📒 已自動帶入 ${note.name || code} 的備忘數值（${note.savedAt}）`;
+    }
+  }
+}
+
+// 渲染備忘錄頁面
+function renderNotesPage() {
+  const wrap = $('notesContent');
+  if (!wrap) return;
+  const notes = getAllNotes();
+
+  if (notes.length === 0) {
+    wrap.innerHTML = `<div style="color:var(--text3);text-align:center;padding:60px;">
+      <div style="font-size:40px;margin-bottom:12px;">📒</div>
+      <div style="font-size:14px;">尚無儲存記錄</div>
+      <div style="font-size:11px;margin-top:6px;">完成任意一次分析後會自動儲存</div>
+    </div>`;
+    return;
+  }
+
+  const cards = notes.map(n => {
+    const fields = MANUAL_FIELDS.map(f => {
+      const val = n[f.id];
+      if (val == null) return '';
+      return `<div style="display:flex;justify-content:space-between;align-items:center;
+        padding:4px 0;border-bottom:1px solid var(--border);">
+        <span style="font-size:11px;color:var(--text3);">${f.label}</span>
+        <span style="font-size:12px;font-weight:700;color:#e0f0ff;">${val}</span>
+      </div>`;
+    }).join('');
+
+    return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+      padding:16px;margin-bottom:12px;">
+      <!-- 標題列 -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div>
+          <span style="font-size:16px;font-weight:800;color:#e0f0ff;">${n.name || n.code}</span>
+          <span style="font-size:12px;color:var(--text3);margin-left:8px;">${n.code}</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span style="font-size:10px;color:var(--text3);">更新：${n.savedAt || '—'}</span>
+          <button onclick="loadNoteToForm('${n.code}')"
+            style="font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;
+            background:rgba(96,165,250,.15);color:var(--cyan);border:1px solid rgba(96,165,250,.3);">
+            📋 套用
+          </button>
+          <button onclick="deleteStockNote('${n.code}')"
+            style="font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;
+            background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.3);">
+            🗑
+          </button>
+        </div>
+      </div>
+      <!-- 欄位值 -->
+      <div>${fields}</div>
+    </div>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">
+      共 ${notes.length} 筆記錄・儲存於瀏覽器本機
+    </div>
+    ${cards}`;
+}
+
+// 備忘錄頁面的「套用」按鈕：切回分析頁並填入欄位
+function loadNoteToForm(code) {
+  // 先在 stockCode 填入代號
+  const inp = $('stockCode');
+  if (inp) inp.value = code;
+
+  // 切到分析頁
+  document.querySelectorAll('.htab').forEach(el => el.classList.remove('active'));
+  const analysisTab = document.querySelector('.htab');
+  if (analysisTab) analysisTab.classList.add('active');
+  ['page-analysis','page-trades','page-positions','page-notes'].forEach(id => $(id).style.display='none');
+  $('page-analysis').style.display = 'block';
+
+  // 帶入欄位值（不用等抓取，直接填入）
+  autoFillFromNote(code);
+
+  // 提示
+  const bar = $('statusBar');
+  if (bar) { bar.textContent = `📒 已載入 ${code} 的備忘數值，可直接按「抓取」更新技術指標`; bar.className='status success'; }
+}
+
 </script>
 </body>
 </html>
