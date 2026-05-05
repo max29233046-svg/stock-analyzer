@@ -448,7 +448,7 @@ input[type=range]::-webkit-slider-thumb {
       <button class="htab active" onclick="switchPage('analysis',this)">📊 分析</button>
       <button class="htab" onclick="switchPage('trades',this)">📋 交易記錄</button>
       <button class="htab" onclick="switchPage('positions',this)">💼 持倉追蹤</button>
-      <button class="htab" onclick="switchPage('notes',this)">📒 個股備忘</button>
+      <button class="htab" onclick="switchPage('notes',this)">📒 個股手動輸入數值備忘</button>
     </div>
     <div style="display:flex;align-items:center;gap:8px;">
       <button onclick="openTokenModal(false)" style="background:var(--bg3);border:1px solid var(--border2);color:var(--text2);border-radius:6px;padding:5px 10px;font-size:11px;cursor:pointer;" title="設定 FinMind Token">⚙️ Token</button>
@@ -604,11 +604,11 @@ input[type=range]::-webkit-slider-thumb {
   </div>
 </div>
 
-<!-- 頁面四：個股備忘 -->
+<!-- 頁面四：個股手動輸入數值備忘 -->
 <div id="page-notes" style="display:none;">
   <div class="trade-page">
     <div class="page-header">
-      <h2>📒 個股備忘</h2>
+      <h2>📒 個股手動輸入數值備忘</h2>
       <div style="display:flex;gap:8px;align-items:center;">
         <button class="search-btn" onclick="renderNotesPage()" style="background:var(--bg3);">🔄 重新整理</button>
         <button class="search-btn" onclick="clearAllNotes()" style="background:rgba(239,68,68,.15);color:var(--red);border-color:var(--red);">🗑 清除全部</button>
@@ -616,7 +616,8 @@ input[type=range]::-webkit-slider-thumb {
     </div>
     <div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:11px;color:var(--text2);line-height:1.7;">
       💡 此處儲存每支個股的<strong style="color:#e0f0ff">手動填寫欄位</strong>（淨利成長、毛利率變化、ROIC、預期EPS成長、景氣能見度、風險評分）。<br>
-      輸入股票代號並按分析時，系統會自動帶入最近一次儲存的數值。資料儲存於瀏覽器本機（localStorage），清除瀏覽器資料會一併刪除。
+      每次分析後自動儲存；若數值有變動，<strong style="color:#e0f0ff">舊版本會保留</strong>為歷史記錄，系統永遠自動帶入<strong style="color:#e0f0ff">最新一筆</strong>。<br>
+      資料儲存於瀏覽器本機（localStorage），清除瀏覽器資料會一併刪除。
     </div>
     <div id="notesContent">
       <div style="color:var(--text3);text-align:center;padding:60px;">尚無儲存記錄</div>
@@ -2788,11 +2789,14 @@ document.querySelectorAll('.modal-overlay').forEach(el => {
 });
 
 /* ══════════════════════════════════════════════════════════
-   個股備忘：localStorage 管理（v3.4）
+   個股手動輸入數值備忘：localStorage 管理（v3.4）
    儲存格式：localStorage key = 'stockNote_XXXX'
-   value = JSON { netProfitYoY, marginChange, roic,
-                  futureEps, bizCycle, riskScore,
-                  savedAt, name }
+   value = JSON 陣列，每筆格式：
+   { netProfitYoY, marginChange, roic,
+     futureEps, bizCycle, riskScore,
+     createdAt, name }
+   ─ 每次分析若數值與最新一筆不同才新增
+   ─ 自動帶入永遠取陣列最後一筆（最新）
 ══════════════════════════════════════════════════════════ */
 const NOTE_PREFIX = 'stockNote_';
 
@@ -2806,10 +2810,35 @@ const MANUAL_FIELDS = [
   { id: 'riskScore',   label: '風險評分 (1-10)',        type: 'range'  },
 ];
 
+// 讀取某支股票的所有歷史備忘（陣列，最舊→最新）
+function loadStockNotes(code) {
+  try {
+    const raw = localStorage.getItem(NOTE_PREFIX + code);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    // 相容舊版單物件格式（自動升級成陣列）
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch(e) { return []; }
+}
+
+// 讀取最新一筆備忘
+function loadStockNote(code) {
+  const arr = loadStockNotes(code);
+  return arr.length > 0 ? arr[arr.length - 1] : null;
+}
+
+// 判斷兩筆數值是否完全相同（只比較手動欄位）
+function isSameValues(a, b) {
+  if (!a || !b) return false;
+  return MANUAL_FIELDS.every(f => String(a[f.id] ?? '') === String(b[f.id] ?? ''));
+}
+
 // 儲存當次分析的手動欄位
+// ─ 與最新一筆相同 → 不動（避免重複）
+// ─ 不同或首次 → 追加一筆新記錄
 function saveStockNote(code, data) {
   if (!code) return;
-  const note = {
+  const newEntry = {
     netProfitYoY: data.netProfitYoY,
     marginChange:  data.marginChange,
     roic:          data.roic,
@@ -2817,22 +2846,18 @@ function saveStockNote(code, data) {
     bizCycle:      data.bizCycle,
     riskScore:     data.riskScore,
     name:          fetchedData.name || code,
-    savedAt:       new Date().toLocaleString('zh-TW'),
+    createdAt:     new Date().toLocaleString('zh-TW'),
   };
+  const arr = loadStockNotes(code);
+  const latest = arr.length > 0 ? arr[arr.length - 1] : null;
+  if (isSameValues(latest, newEntry)) return; // 沒變化，不新增
+  arr.push(newEntry);
   try {
-    localStorage.setItem(NOTE_PREFIX + code, JSON.stringify(note));
+    localStorage.setItem(NOTE_PREFIX + code, JSON.stringify(arr));
   } catch(e) { console.error('[saveStockNote]', e); }
 }
 
-// 讀取某支股票的備忘
-function loadStockNote(code) {
-  try {
-    const raw = localStorage.getItem(NOTE_PREFIX + code);
-    return raw ? JSON.parse(raw) : null;
-  } catch(e) { return null; }
-}
-
-// 取得所有備忘記錄
+// 取得所有股票的備忘（每支只取最新一筆，供備忘頁列表用）
 function getAllNotes() {
   const notes = [];
   try {
@@ -2840,26 +2865,41 @@ function getAllNotes() {
       const key = localStorage.key(i);
       if (key && key.startsWith(NOTE_PREFIX)) {
         const code = key.replace(NOTE_PREFIX, '');
-        const raw  = localStorage.getItem(key);
-        if (raw) {
-          try { notes.push({ code, ...JSON.parse(raw) }); } catch(e) {}
+        const arr  = loadStockNotes(code);
+        if (arr.length > 0) {
+          notes.push({ code, latest: arr[arr.length - 1], history: arr });
         }
       }
     }
   } catch(e) {}
-  return notes.sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''));
+  // 按最新一筆時間降冪排列
+  return notes.sort((a, b) =>
+    (b.latest.createdAt || '').localeCompare(a.latest.createdAt || ''));
 }
 
-// 刪除單筆備忘
+// 刪除單支股票的所有備忘
 function deleteStockNote(code) {
-  if (!confirm(`確定刪除 ${code} 的備忘記錄？`)) return;
+  if (!confirm(`確定刪除 ${code} 的所有備忘記錄？`)) return;
   localStorage.removeItem(NOTE_PREFIX + code);
+  renderNotesPage();
+}
+
+// 刪除單支股票的某一筆歷史（by index）
+function deleteNoteEntry(code, idx) {
+  const arr = loadStockNotes(code);
+  if (idx < 0 || idx >= arr.length) return;
+  arr.splice(idx, 1);
+  if (arr.length === 0) {
+    localStorage.removeItem(NOTE_PREFIX + code);
+  } else {
+    localStorage.setItem(NOTE_PREFIX + code, JSON.stringify(arr));
+  }
   renderNotesPage();
 }
 
 // 清除全部備忘
 function clearAllNotes() {
-  if (!confirm('確定清除所有個股備忘？此操作不可復原。')) return;
+  if (!confirm('確定清除所有個股手動輸入數值備忘？此操作不可復原。')) return;
   const keys = [];
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
@@ -2869,9 +2909,9 @@ function clearAllNotes() {
   renderNotesPage();
 }
 
-// 抓取完畢後自動帶入手動欄位（帶入後欄位閃黃提示）
+// 抓取完畢後自動帶入手動欄位（永遠帶最新一筆，閃黃提示）
 function autoFillFromNote(code) {
-  const note = loadStockNote(code);
+  const note = loadStockNote(code); // 最新一筆
   if (!note) return;
 
   let filled = 0;
@@ -2881,7 +2921,6 @@ function autoFillFromNote(code) {
     const el = $(f.id);
     if (!el) return;
     el.value = val;
-    // range 同步更新顯示數字
     if (f.type === 'range') {
       const sv = el.id === 'bizCycle' ? $('sv1') : $('sv2');
       if (sv) sv.textContent = val;
@@ -2890,19 +2929,16 @@ function autoFillFromNote(code) {
     el.style.transition = 'border-color 0.3s, box-shadow 0.3s';
     el.style.borderColor = '#f59e0b';
     el.style.boxShadow   = '0 0 0 2px rgba(245,158,11,0.3)';
-    setTimeout(() => {
-      el.style.borderColor = '';
-      el.style.boxShadow   = '';
-    }, 1800);
+    setTimeout(() => { el.style.borderColor = ''; el.style.boxShadow = ''; }, 1800);
     filled++;
   });
 
   if (filled > 0) {
-    // 在 status bar 補充提示
     const bar = $('statusBar');
     if (bar) {
-      const old = bar.textContent;
-      bar.textContent = old + `　📒 已自動帶入 ${note.name || code} 的備忘數值（${note.savedAt}）`;
+      const arr = loadStockNotes(code);
+      const hint = arr.length > 1 ? `（共 ${arr.length} 筆歷史，已帶入最新）` : '';
+      bar.textContent = bar.textContent + `　📒 已自動帶入 ${note.name || code} 的備忘數值 ${hint}（${note.createdAt}）`;
     }
   }
 }
@@ -2922,9 +2958,10 @@ function renderNotesPage() {
     return;
   }
 
-  const cards = notes.map(n => {
-    const fields = MANUAL_FIELDS.map(f => {
-      const val = n[f.id];
+  const cards = notes.map(({ code, latest, history }) => {
+    // 最新一筆的欄位值
+    const latestFields = MANUAL_FIELDS.map(f => {
+      const val = latest[f.id];
       if (val == null) return '';
       return `<div style="display:flex;justify-content:space-between;align-items:center;
         padding:4px 0;border-bottom:1px solid var(--border);">
@@ -2933,43 +2970,81 @@ function renderNotesPage() {
       </div>`;
     }).join('');
 
+    // 歷史記錄折疊區（最舊→較新，不含最新）
+    let historyHTML = '';
+    if (history.length > 1) {
+      const histRows = history.slice(0, -1).map((h, i) => {
+        const vals = MANUAL_FIELDS.map(f =>
+          h[f.id] != null ? `<span style="color:var(--text3);font-size:10px;">${f.label.split(' ')[0]}:
+          <strong style="color:var(--text2);">${h[f.id]}</strong></span>` : ''
+        ).filter(Boolean).join('　');
+        return `<div style="padding:6px 10px;background:var(--bg1);border-radius:6px;margin-bottom:4px;
+          display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div>
+            <div style="font-size:10px;color:var(--text3);margin-bottom:3px;">📅 ${h.createdAt || '—'}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;">${vals}</div>
+          </div>
+          <button onclick="deleteNoteEntry('${code}', ${i})"
+            style="font-size:10px;padding:3px 8px;border-radius:5px;cursor:pointer;flex-shrink:0;
+            background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.3);">
+            🗑
+          </button>
+        </div>`;
+      }).join('');
+
+      historyHTML = `
+        <details style="margin-top:10px;">
+          <summary style="font-size:11px;color:var(--text3);cursor:pointer;user-select:none;
+            padding:4px 0;list-style:none;">
+            ▸ 查看歷史記錄（共 ${history.length - 1} 筆舊版本）
+          </summary>
+          <div style="margin-top:8px;">${histRows}</div>
+        </details>`;
+    }
+
     return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;
       padding:16px;margin-bottom:12px;">
       <!-- 標題列 -->
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
         <div>
-          <span style="font-size:16px;font-weight:800;color:#e0f0ff;">${n.name || n.code}</span>
-          <span style="font-size:12px;color:var(--text3);margin-left:8px;">${n.code}</span>
+          <span style="font-size:16px;font-weight:800;color:#e0f0ff;">${latest.name || code}</span>
+          <span style="font-size:12px;color:var(--text3);margin-left:8px;">${code}</span>
+          <span style="font-size:10px;color:var(--text3);margin-left:8px;">
+            共 ${history.length} 筆記錄
+          </span>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
-          <span style="font-size:10px;color:var(--text3);">更新：${n.savedAt || '—'}</span>
-          <button onclick="loadNoteToForm('${n.code}')"
+          <button onclick="loadNoteToForm('${code}')"
             style="font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;
             background:rgba(96,165,250,.15);color:var(--cyan);border:1px solid rgba(96,165,250,.3);">
-            📋 套用
+            📋 套用最新
           </button>
-          <button onclick="deleteStockNote('${n.code}')"
+          <button onclick="deleteStockNote('${code}')"
             style="font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;
             background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.3);">
-            🗑
+            🗑 全刪
           </button>
         </div>
       </div>
-      <!-- 欄位值 -->
-      <div>${fields}</div>
+      <!-- 最新一筆 -->
+      <div style="font-size:10px;color:var(--cyan);margin-bottom:6px;font-weight:600;">
+        ✦ 最新版本・${latest.createdAt || '—'}
+      </div>
+      <div>${latestFields}</div>
+      <!-- 歷史折疊 -->
+      ${historyHTML}
     </div>`;
   }).join('');
 
   wrap.innerHTML = `
     <div style="font-size:11px;color:var(--text3);margin-bottom:12px;">
-      共 ${notes.length} 筆記錄・儲存於瀏覽器本機
+      共 ${notes.length} 支個股・儲存於瀏覽器本機
     </div>
     ${cards}`;
 }
 
-// 備忘錄頁面的「套用」按鈕：切回分析頁並填入欄位
+// 備忘錄頁面的「套用最新」按鈕：切回分析頁並填入最新一筆
 function loadNoteToForm(code) {
-  // 先在 stockCode 填入代號
   const inp = $('stockCode');
   if (inp) inp.value = code;
 
@@ -2980,12 +3055,16 @@ function loadNoteToForm(code) {
   ['page-analysis','page-trades','page-positions','page-notes'].forEach(id => $(id).style.display='none');
   $('page-analysis').style.display = 'block';
 
-  // 帶入欄位值（不用等抓取，直接填入）
   autoFillFromNote(code);
 
-  // 提示
   const bar = $('statusBar');
-  if (bar) { bar.textContent = `📒 已載入 ${code} 的備忘數值，可直接按「抓取」更新技術指標`; bar.className='status success'; }
+  if (bar) {
+    const arr = loadStockNotes(code);
+    bar.textContent = `📒 已載入 ${code} 的最新備忘數值（共 ${arr.length} 筆歷史），可直接按「抓取」更新技術指標`;
+    bar.className = 'status success';
+  }
+}
+
 }
 
 </script>
